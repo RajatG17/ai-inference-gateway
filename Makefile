@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate migrate-gen
+.PHONY: up down logs migrate migrate-gen bootstrap
 
 up:
 	docker compose -f infra/docker-compose.yml up --build
@@ -11,3 +11,5 @@ migrate:
 # Generate a new migration from model changes. Usage: make migrate-gen msg="add users table"
 migrate-gen:
 	alembic revision --autogenerate -m "$(msg)"
+bootstrap:
+	python scripts/bootstrap.py

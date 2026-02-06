@@ -4,7 +4,8 @@ from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 
 from app.db import db_ping
-from app.deps import get_current_api_key
+# from app.deps import get_current_api_key
+from app.auth import require_api_key, AuthContext
 from app.models.api_key import ApiKey
 
 app = FastAPI(
@@ -30,7 +31,7 @@ async def readyz():
 @app.post("/v1/predict", response_model=PredictResponse)
 def predict(
     req: PredictRequest,
-    _api_key: Annotated[ApiKey, Depends(get_current_api_key)],
+    auth: AuthContext = Depends(require_api_key),
 ):
     return PredictResponse(output=f"echo: {req.prompt}")
 
