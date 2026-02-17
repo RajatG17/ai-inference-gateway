@@ -8,9 +8,10 @@ from app.db import db_ping, redis_ping
 from app.auth import require_api_key, AuthContext
 from app.models.api_key import ApiKey
 from app.rate_limit import check_rate_limit
-from app.cache import build_cache_key, cache_get, cache_set
+from app.cache import build_cache_key, cache_get, cache_set, acquire_lock, release_lock
 
 import json
+import asyncio
 
 app = FastAPI(
     title="AI Inference Gateway",
@@ -64,7 +65,29 @@ async def predict(
             data = json.loads(cached)
             return PredictResponse(**data)
 
-        await cache_set(cache_key, json.dumps({"output": f"[tenant={auth.tenant_id}] echo: {req.prompt}"}))
+        acquired = await acquire_lock(f"lock:{cache_key}")
+
+        if not acquired:
+            # Another request is processing the same input, wait for it to finish
+            for _ in range(20):
+                await asyncio.sleep(1)
+                cached = await cache_get(cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    return PredictResponse(**data)
+            # Timeout waiting for lock, proceed without cache
+        else:
+            try:
+                output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                response_payload = json.dumps({"output": output})
+                await cache_set(cache_key, response_payload)
+                return PredictResponse(output=output)
+            finally:
+                await release_lock(f"lock:{cache_key}")
+
+        # if acquired:
+        #     await cache_set(cache_key, json.dumps({"output": f"[tenant={auth.tenant_id}] echo: {req.prompt}"}))
+        #     await release_lock(f"lock:{cache_key}")
 
     return PredictResponse(output=f"[tenant={auth.tenant_id}] echo: {req.prompt}")
 

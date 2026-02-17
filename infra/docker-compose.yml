@@ -35,10 +35,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    env_file:
-      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ai_gateway}:${POSTGRES_PASSWORD:-ai_gateway}@postgres:5432/${POSTGRES_DB:-ai_gateway}
+      API_KEY_PEPPER: superdev-pepper
+      REDIS_URL: redis://redis:6379/0
+      REDIS_HOST: redis
       
-
 
 volumes:
   postgres_data:
