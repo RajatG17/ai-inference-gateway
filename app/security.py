@@ -7,3 +7,7 @@ def _pepper():
 
 def hash_api_key(api_key: str):
     return hmac.new(_pepper(), api_key.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def generate_cache_key(prompt: str, model: str):
+    raw = f"{model}:{prompt}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
