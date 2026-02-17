@@ -13,3 +13,6 @@ migrate-gen:
 	alembic revision --autogenerate -m "$(msg)"
 bootstrap:
 	python scripts/bootstrap.py
+generate-key:
+	docker compose -f infra/docker-compose.yml exec api python scripts/bootstrap.py
+
