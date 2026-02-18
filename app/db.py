@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.config import get_database_url
 from app.models.base import Base
 
+from app.redis import redis_client
+
 engine = create_async_engine(
     get_database_url(),
     echo=False,
@@ -41,3 +43,10 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
+
+async def redis_ping():
+    try:
+        await redis_client.ping()
+        return True
+    except Exception:
+        return False

@@ -16,6 +16,12 @@ services:
       timeout: 5s
       retries: 20
 
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   api:
     build:
       context: ..
@@ -26,8 +32,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ai_gateway}:${POSTGRES_PASSWORD:-ai_gateway}@postgres:5432/${POSTGRES_DB:-ai_gateway}
+      API_KEY_PEPPER: superdev-pepper
+      REDIS_URL: redis://redis:6379/0
+
+
 
 volumes:
   postgres_data:

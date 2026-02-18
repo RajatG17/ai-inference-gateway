@@ -38,10 +38,11 @@ async def get_current_api_key(
     result = await db.execute(
         select(ApiKey).where(
             ApiKey.key_hash == key_hash,
-            ApiKey.revoked_at.is_(None),
+            ApiKey.is_active.is_(True),
         )
     )
     row = result.scalar_one_or_none()
+    print("ROW:", row)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
