@@ -26,6 +26,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -38,8 +39,8 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ai_gateway}:${POSTGRES_PASSWORD:-ai_gateway}@postgres:5432/${POSTGRES_DB:-ai_gateway}
       API_KEY_PEPPER: superdev-pepper
       REDIS_URL: redis://redis:6379/0
-
-
+      REDIS_HOST: redis
+      
 
 volumes:
   postgres_data:
