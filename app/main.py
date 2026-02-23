@@ -18,6 +18,7 @@ from app.metrics import (
     RATE_LIMIT_HITS, 
     ERROR_COUNT
 )
+from app.backends.factory import get_backend
 
 import json
 import asyncio
@@ -27,7 +28,11 @@ app = FastAPI(
     title="AI Inference Gateway",
     version="0.1.0"
 )
+
 metrics_app = make_asgi_app()
+
+# initialize backen
+backend = get_backend()
 
 app.mount("/metrics/", metrics_app)
 
@@ -104,14 +109,27 @@ async def predict(
                         data = json.loads(cached)
                         return PredictResponse(**data)
                 # Timeout waiting for lock, proceed without cache
-                output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                # output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                output = await backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                )
                 REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
                 REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
                 return PredictResponse(output=output)
             
             # lock acquired, generate response and populate cache
             try:
-                output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                # output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                output = await backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                )
+
                 response_payload = json.dumps({"output": output})
                 await cache_set(cache_key, response_payload)
                 REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
@@ -122,7 +140,13 @@ async def predict(
                 await release_lock(f"lock:{cache_key}")
         
         # cache bypass, directly generate response
-        output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+        # output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+        output = await backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                )
         REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
         REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
 
