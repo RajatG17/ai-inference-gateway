@@ -18,7 +18,7 @@ from app.metrics import (
     RATE_LIMIT_HITS, 
     ERROR_COUNT
 )
-from app.backends.factory import get_backend
+from app.backends.router import BackendRouter
 
 import json
 import asyncio
@@ -32,7 +32,7 @@ app = FastAPI(
 metrics_app = make_asgi_app()
 
 # initialize backen
-backend = get_backend()
+router = BackendRouter()
 
 app.mount("/metrics/", metrics_app)
 
@@ -64,6 +64,8 @@ async def predict(
 ):
     tenant = str(auth.tenant_id)
     start_time = time.time()
+    # use router to get the appropriate backend for the requested model
+    backend = router.get_backend_for_model(req.model)
 
     ###############################
     try:    

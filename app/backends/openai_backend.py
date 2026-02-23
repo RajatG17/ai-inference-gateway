@@ -18,12 +18,17 @@ class OpenAIBackend(InferenceBackend):
             max_tokens: int
     ) -> str:
         
-        response = await self.client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+        try:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        except Exception as e:
+            # log error
+            print(f"OpenAI API error: {e}")
+            raise
 
         return str(response.choices[0].message.content)
     
