@@ -40,6 +40,8 @@ services:
       API_KEY_PEPPER: superdev-pepper
       REDIS_URL: redis://redis:6379/0
       REDIS_HOST: redis
+    env_file:
+      - ../.env
       
 
 volumes:

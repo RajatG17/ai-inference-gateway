@@ -15,4 +15,5 @@ bootstrap:
 	python scripts/bootstrap.py
 generate-key:
 	docker compose -f infra/docker-compose.yml exec api python scripts/bootstrap.py
-
+get-key:
+	make migrate && make generate-key

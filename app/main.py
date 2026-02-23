@@ -1,7 +1,8 @@
 from typing import Annotated
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+from prometheus_client import make_asgi_app
 
 from app.db import db_ping, redis_ping
 # from app.deps import get_current_api_key
@@ -9,14 +10,31 @@ from app.auth import require_api_key, AuthContext
 from app.models.api_key import ApiKey
 from app.rate_limit import check_rate_limit
 from app.cache import build_cache_key, cache_get, cache_set, acquire_lock, release_lock
+from app.metrics import (
+    REQUEST_COUNT, 
+    REQUEST_LATENCY, 
+    CACHE_HITS, 
+    CACHE_MISSES, 
+    RATE_LIMIT_HITS, 
+    ERROR_COUNT
+)
+from app.backends.router import BackendRouter
 
 import json
 import asyncio
+import time
 
 app = FastAPI(
     title="AI Inference Gateway",
     version="0.1.0"
 )
+
+metrics_app = make_asgi_app()
+
+# initialize backen
+router = BackendRouter()
+
+app.mount("/metrics/", metrics_app)
 
 class PredictRequest(BaseModel):
     prompt: str
@@ -35,59 +53,115 @@ def healthz():
 @app.get("/readyz")
 async def readyz():
     db_ok = await db_ping()
-    redids_ok = await redis_ping()
-    ready = db_ok and redids_ok
-    return {"status": "ready" if ready else "not ready", "db": db_ok, "redis": redids_ok}
+    redis_ok = await redis_ping()
+    ready = db_ok and redis_ok
+    return {"status": "ready" if ready else "not ready", "db": db_ok, "redis": redis_ok}
 
 @app.post("/v1/predict", response_model=PredictResponse)
 async def predict(
     req: PredictRequest,
     auth: AuthContext = Depends(require_api_key),
 ):
-    
-    await check_rate_limit(str(auth.tenant_id), str(auth.api_key_id))
+    tenant = str(auth.tenant_id)
+    start_time = time.time()
+    # use router to get the appropriate backend for the requested model
+    backend = router.get_backend_for_model(req.model)
 
-    params = {
-        "temperature": req.temperature,
-        "max_tokens": req.max_tokens
-    }
+    ###############################
+    try:    
+        # rate limiter will raise HTTPException with status code 429 if limit is exceeded
+        await check_rate_limit(str(auth.tenant_id), str(auth.api_key_id))
 
-    cache_key = build_cache_key(
-        tenant_id = str(auth.tenant_id),
-        model = req.model,
-        prompt = req.prompt,
-        params = params
-    )
+        params = {
+            "temperature": req.temperature,
+            "max_tokens": req.max_tokens
+        }
 
-    if not req.cache_bypass:
-        cached = await cache_get(cache_key)
-        if cached:
-            data = json.loads(cached)
-            return PredictResponse(**data)
+        cache_key = build_cache_key(
+            tenant_id = str(auth.tenant_id),
+            model = req.model,
+            prompt = req.prompt,
+            params = params
+        )
 
-        acquired = await acquire_lock(f"lock:{cache_key}")
+        # read through cache unless cache_bypass is True
+        if not req.cache_bypass:
+            cached = await cache_get(cache_key)
+            if cached:
+                CACHE_HITS.labels(tenant_id=tenant).inc()
+                REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
+                REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
+                data = json.loads(cached)
+                return PredictResponse(**data)
+            
+            CACHE_MISSES.labels(tenant_id=tenant).inc()
 
-        if not acquired:
-            # Another request is processing the same input, wait for it to finish
-            for _ in range(20):
-                await asyncio.sleep(1)
-                cached = await cache_get(cache_key)
-                if cached:
-                    data = json.loads(cached)
-                    return PredictResponse(**data)
-            # Timeout waiting for lock, proceed without cache
-        else:
+            # acquire a lock to prevent thundering herd on cache miss
+            acquired = await acquire_lock(f"lock:{cache_key}")
+
+            if not acquired:
+                # Another request is processing the same input, wait for it to finish
+                for _ in range(20):
+                    await asyncio.sleep(0.1)
+                    cached = await cache_get(cache_key)
+                    if cached:
+                        CACHE_HITS.labels(tenant_id=tenant).inc()
+                        REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
+                        REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
+                        data = json.loads(cached)
+                        return PredictResponse(**data)
+                # Timeout waiting for lock, proceed without cache
+                # output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                output = await backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                )
+                REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
+                REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
+                return PredictResponse(output=output)
+            
+            # lock acquired, generate response and populate cache
             try:
-                output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                # output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+                output = await backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                )
+
                 response_payload = json.dumps({"output": output})
                 await cache_set(cache_key, response_payload)
+                REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
+                REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
                 return PredictResponse(output=output)
+                # return PredictResponse(output=f"[tenant={auth.tenant_id}] echo: {req.prompt}")
             finally:
                 await release_lock(f"lock:{cache_key}")
+        
+        # cache bypass, directly generate response
+        # output = f"[tenant={auth.tenant_id}] echo: {req.prompt}"
+        output = await backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                )
+        REQUEST_COUNT.labels(tenant_id=tenant, status="success").inc()
+        REQUEST_LATENCY.labels(tenant_id=tenant).observe(time.time() - start_time)
 
-        # if acquired:
-        #     await cache_set(cache_key, json.dumps({"output": f"[tenant={auth.tenant_id}] echo: {req.prompt}"}))
-        #     await release_lock(f"lock:{cache_key}")
+        return PredictResponse(output=output)
 
-    return PredictResponse(output=f"[tenant={auth.tenant_id}] echo: {req.prompt}")
+    except HTTPException as e:
+        if e.status_code == 429:
+            RATE_LIMIT_HITS.labels(tenant_id=tenant).inc()
+        REQUEST_COUNT.labels(tenant_id=tenant, status="error").inc()
+        ERROR_COUNT.labels(tenant_id=tenant, error_type=str(e.status_code)).inc()
+        raise   
 
+    except Exception as e:
+        REQUEST_COUNT.labels(tenant_id=tenant, status="error").inc()
+        ERROR_COUNT.labels(tenant_id=tenant, error_type="internal").inc()
+        raise
