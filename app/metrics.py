@@ -34,3 +34,15 @@ ERROR_COUNT = Counter(
     "Total inference errors",
     ["tenant_id", "error_type"]
 )
+
+PROVIDER_FAILURES = Counter(
+    "provider_failures_total",
+    "Provider failures",
+    ["provider"]
+)
+
+PROVIDER_REJECTIONS = Counter(
+    "provider_circuit_open_total",
+    "Requests rejected due to open cirvuit",
+    ["provider"]
+)
