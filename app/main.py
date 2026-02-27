@@ -10,6 +10,11 @@ from app.auth import require_api_key, AuthContext
 from app.models.api_key import ApiKey
 from app.rate_limit import check_rate_limit
 from app.cache import build_cache_key, cache_get, cache_set, acquire_lock, release_lock
+from app.config import (
+    INFERENCE_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+    RETRY_BACKOFF_BASE
+)
 from app.metrics import (
     REQUEST_COUNT, 
     REQUEST_LATENCY, 
@@ -17,7 +22,10 @@ from app.metrics import (
     CACHE_MISSES, 
     RATE_LIMIT_HITS, 
     ERROR_COUNT,
-    PROVIDER_FAILURES
+    PROVIDER_FAILURES,
+    RETRY_COUNT,
+    TIMEOUT_COUNT,
+    FALLBACK_ATTEMPTS
 )
 from app.backends.router import BackendRouter
 from app.logging_config import configure_logging
@@ -28,6 +36,7 @@ import asyncio
 import time
 import structlog
 import uuid
+import random
 
 app = FastAPI(
     title="AI Inference Gateway",
@@ -64,6 +73,53 @@ async def readyz():
     ready = db_ok and redis_ok
     return {"status": "ready" if ready else "not ready", "db": db_ok, "redis": redis_ok}
 
+async def _execute_with_resilience(
+        backend,
+        fallback_backend,
+        req,
+        tenant: str,
+):
+    last_exception = None
+    print(f"Executing with resilience: backend={backend}, fallback={fallback_backend}, tenant={tenant}")
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return await asyncio.wait_for(
+                backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens,
+                ),
+                timeout=INFERENCE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            TIMEOUT_COUNT.labels(tenant_id=tenant).inc()
+            RETRY_COUNT.labels(tenant_id=tenant).inc()
+            last_exception = Exception("backend_timeout")
+        except Exception as e:
+            RETRY_COUNT.labels(tenant_id=tenant).inc()
+            last_exception = e
+        
+        await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+
+    if fallback_backend:
+        FALLBACK_ATTEMPTS.labels(tenant_id=tenant).inc()
+        print(f"Attempting fallback: backend={fallback_backend}, tenant={tenant}")
+        try:
+            return await asyncio.wait_for(
+                fallback_backend.predict(
+                    prompt=req.prompt,
+                    model=req.model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens
+                ),
+                timeout=INFERENCE_TIMEOUT_SECONDS
+            )
+        except Exception as e:
+            last_exception = e
+    
+    raise last_exception
+
 
 @app.post("/v1/predict", response_model=PredictResponse)
 async def predict(
@@ -74,14 +130,15 @@ async def predict(
     start_time = time.time()
 
     # Route to backend
-    backend, breaker, provider = router.get_backend_for_model(req.model)
+    backend, breaker, provider, fallback = router.get_backend_for_model(req.model)
     backend_name = backend.__class__.__name__
+    print(f"Routed request to backend: {backend_name}, provider: {provider}, fallback: {fallback}")
 
     try:
-        # 1️⃣ Rate limit check
+        # Rate limit check
         await check_rate_limit(tenant, str(auth.api_key_id))
 
-        # 2️⃣ Build cache key
+        # Build cache key
         params = {
             "temperature": req.temperature,
             "max_tokens": req.max_tokens
@@ -94,7 +151,7 @@ async def predict(
             params=params
         )
 
-        # 3️⃣ Try cache first
+        # Try cache first
         if not req.cache_bypass:
             cached = await cache_get(cache_key)
             if cached:
@@ -117,21 +174,29 @@ async def predict(
             output = await _run_with_lock(
                 cache_key=cache_key,
                 backend=backend,
+                fallback_backend=fallback,
                 req=req,
                 tenant=tenant,
                 backend_name=backend_name
             )
 
         else:
-            # 4️⃣ Direct inference (cache bypass)
-            output = await backend.predict(
-                prompt=req.prompt,
-                model=req.model,
-                temperature=req.temperature,
-                max_tokens=req.max_tokens,
+            #  Direct inference (cache bypass) - no cache read or write
+            # Replace with resilient execution that includes retries and fallback
+            output = await _execute_with_resilience(
+                backend=backend,
+                fallback_backend=fallback,
+                req=req,
+                tenant=tenant
             )
+            # output = await backend.predict(
+            #     prompt=req.prompt,
+            #     model=req.model,
+            #     temperature=req.temperature,
+            #     max_tokens=req.max_tokens,
+            # )
 
-        # 5️⃣ Success path
+        # Success path
         _record_success_metrics(tenant, start_time)
 
         logger.info(
@@ -179,6 +244,7 @@ async def predict(
 async def _run_with_lock(
     cache_key: str,
     backend,
+    fallback_backend,
     req: PredictRequest,
     tenant: str,
     backend_name: str,
@@ -196,20 +262,33 @@ async def _run_with_lock(
                 return json.loads(cached)["output"]
 
         # Fallback: no cache populated
-        return await backend.predict(
-            prompt=req.prompt,
-            model=req.model,
-            temperature=req.temperature,
-            max_tokens=req.max_tokens,
-        )
+        # replace with resilient execution that includes retries and fallback
+        return await _execute_with_resilience(
+                backend=backend,
+                fallback_backend=fallback_backend,
+                req=req,
+                tenant=tenant
+            )
+        # return await backend.predict(
+        #     prompt=req.prompt,
+        #     model=req.model,
+        #     temperature=req.temperature,
+        #     max_tokens=req.max_tokens,
+        # )
 
     try:
-        output = await backend.predict(
-            prompt=req.prompt,
-            model=req.model,
-            temperature=req.temperature,
-            max_tokens=req.max_tokens,
-        )
+        output = await _execute_with_resilience(
+                backend=backend,
+                fallback_backend=fallback_backend,
+                req=req,
+                tenant=tenant
+            )
+        # output = await backend.predict(
+        #     prompt=req.prompt,
+        #     model=req.model,
+        #     temperature=req.temperature,
+        #     max_tokens=req.max_tokens,
+        # )
 
         response_payload = json.dumps({"output": output})
         await cache_set(cache_key, response_payload)
