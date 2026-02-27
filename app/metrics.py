@@ -46,3 +46,21 @@ PROVIDER_REJECTIONS = Counter(
     "Requests rejected due to open cirvuit",
     ["provider"]
 )
+
+RETRY_COUNT = Counter(
+    "retry_attempts_total",
+    "Number of retry attempts",
+    ["tenant_id"]
+)
+
+TIMEOUT_COUNT = Counter(
+    "timeout_total",
+    "Number of backend timeouts",
+    ["tenant_id"]
+)
+
+FALLBACK_ATTEMPTS = Counter(
+    "fallback_attempts_total",
+    "Number of fallback attempts",
+    ["tenant_id"]
+)

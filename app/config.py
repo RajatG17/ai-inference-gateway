@@ -1,4 +1,10 @@
 import os
+import asyncio
+import random
+
+INFERENCE_TIMEOUT_SECONDS = 10
+MAX_RETRIES = 2
+RETRY_BACKOFF_BASE = 0.5
 
 try:
     from dotenv import load_dotenv
@@ -12,3 +18,4 @@ def get_database_url() -> str:
     if not url:
         raise ValueError("DATABASE_URL environment variable is not set")
     return url
+
