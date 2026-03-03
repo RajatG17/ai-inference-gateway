@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from prometheus_client import make_asgi_app
 
@@ -43,6 +44,18 @@ app = FastAPI(
     version="0.1.8" # 0.1.8 Structured logging, 0.1.7 Backend router, 0.1.6 Metrics and monitoring, 0.1.5 Cache locking, 0.1.4 Cache bypass, 0.1.3 Rate limiting, 0.1.2 Health checks, 0.1.1 API key auth, 0.1.0 Initial version
 )
 
+origins = [
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 metrics_app = make_asgi_app()
 
 # initialize backend
@@ -61,6 +74,11 @@ class PredictRequest(BaseModel):
 
 class PredictResponse(BaseModel):
     output: str
+    latency_ms: float
+    backend: str
+    retries: int
+    fallback_used: bool
+    cache_hit: bool
 
 @app.get("/healthz")
 def healthz():
@@ -80,10 +98,13 @@ async def _execute_with_resilience(
         tenant: str,
 ):
     last_exception = None
+    fallback_used = False
+    retries = 0
+
     print(f"Executing with resilience: backend={backend}, fallback={fallback_backend}, tenant={tenant}")
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(MAX_RETRIES):
         try:
-            return await asyncio.wait_for(
+            output = await asyncio.wait_for(
                 backend.predict(
                     prompt=req.prompt,
                     model=req.model,
@@ -92,21 +113,32 @@ async def _execute_with_resilience(
                 ),
                 timeout=INFERENCE_TIMEOUT_SECONDS
             )
+
+            return {
+                "output" : output,
+                "retries": retries,
+                "fallback_used": fallback_used,
+                "backend_name": backend.__class__.__name__
+            }
+
         except asyncio.TimeoutError:
+            retries += 1
             TIMEOUT_COUNT.labels(tenant_id=tenant).inc()
             RETRY_COUNT.labels(tenant_id=tenant).inc()
             last_exception = Exception("backend_timeout")
         except Exception as e:
+            retries += 1
             RETRY_COUNT.labels(tenant_id=tenant).inc()
             last_exception = e
         
         await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
 
     if fallback_backend:
+        fallback_used = True
         FALLBACK_ATTEMPTS.labels(tenant_id=tenant).inc()
         print(f"Attempting fallback: backend={fallback_backend}, tenant={tenant}")
         try:
-            return await asyncio.wait_for(
+            output = await asyncio.wait_for(
                 fallback_backend.predict(
                     prompt=req.prompt,
                     model=req.model,
@@ -115,6 +147,13 @@ async def _execute_with_resilience(
                 ),
                 timeout=INFERENCE_TIMEOUT_SECONDS
             )
+
+            return {
+                "output" : output,
+                "retries": retries,
+                "fallback_used": fallback_used,
+                "backend_name": fallback_backend.__class__.__name__
+            }
         except Exception as e:
             last_exception = e
     
@@ -128,6 +167,7 @@ async def predict(
 ):
     tenant = str(auth.tenant_id)
     start_time = time.time()
+    cache_hit = False
 
     # Route to backend
     backend, breaker, provider, fallback = router.get_backend_for_model(req.model)
@@ -155,23 +195,26 @@ async def predict(
         if not req.cache_bypass:
             cached = await cache_get(cache_key)
             if cached:
+                cache_hit = True
                 CACHE_HITS.labels(tenant_id=tenant).inc()
                 response_data = json.loads(cached)
+                print(response_data)
 
                 _record_success_metrics(tenant, start_time)
+                
                 logger.info(
                     "inference_success_cache",
                     tenant_id=tenant,
                     model=req.model,
                     backend=backend_name,
                 )
-
-                return PredictResponse(**response_data)
+                latency_ms = round((time.time() - start_time)*1000, 2)
+                return PredictResponse(**response_data, latency_ms=latency_ms, cache_hit=cache_hit, retries=0, fallback_used=False, backend=backend_name)
 
             CACHE_MISSES.labels(tenant_id=tenant).inc()
 
             # Prevent thundering herd
-            output = await _run_with_lock(
+            result = await _run_with_lock(
                 cache_key=cache_key,
                 backend=backend,
                 fallback_backend=fallback,
@@ -179,22 +222,32 @@ async def predict(
                 tenant=tenant,
                 backend_name=backend_name
             )
+            output = result["output"]
+            retries = result["retries"]
+            fallback_used = result["fallback_used"]
+            backend_name = result["backend_name"]
+            
 
         else:
             #  Direct inference (cache bypass) - no cache read or write
             # Replace with resilient execution that includes retries and fallback
-            output = await _execute_with_resilience(
+            result = await _execute_with_resilience(
                 backend=backend,
                 fallback_backend=fallback,
                 req=req,
                 tenant=tenant
             )
+            output = result["output"]
+            retries = result["retries"]
+            fallback_used = result["fallback_used"]
+            backend_name = result["backend_name"]
             # output = await backend.predict(
             #     prompt=req.prompt,
             #     model=req.model,
             #     temperature=req.temperature,
             #     max_tokens=req.max_tokens,
             # )
+
 
         # Success path
         _record_success_metrics(tenant, start_time)
@@ -206,7 +259,13 @@ async def predict(
             backend=backend_name,
         )
 
-        return PredictResponse(output=output)
+        latency_ms = round((time.time() - start_time)*1000, 2)
+        return PredictResponse(output=output,
+                               backend=backend_name,
+                               retries=retries,
+                               fallback_used=fallback_used,
+                               latency_ms=latency_ms,
+                               cache_hit=cache_hit)
 
     except HTTPException as e:
         if e.status_code == 429:
@@ -251,6 +310,7 @@ async def _run_with_lock(
 ):
     lock_key = f"lock:{cache_key}"
     acquired = await acquire_lock(lock_key)
+    cache_hit = False
 
     if not acquired:
         # Wait for other request to populate cache
@@ -258,17 +318,26 @@ async def _run_with_lock(
             await asyncio.sleep(0.1)
             cached = await cache_get(cache_key)
             if cached:
+                cache_hit = True
                 CACHE_HITS.labels(tenant_id=tenant).inc()
                 return json.loads(cached)["output"]
 
         # Fallback: no cache populated
         # replace with resilient execution that includes retries and fallback
-        return await _execute_with_resilience(
+        result = await _execute_with_resilience(
                 backend=backend,
                 fallback_backend=fallback_backend,
                 req=req,
                 tenant=tenant
             )
+        
+        return {
+            "output": result["output"],
+            "retries": result["retries"],
+            "fallback_used": result["fallback_used"],
+            "cache_hit": cache_hit,
+            "backend_name": result["backend_name"]
+        }
         # return await backend.predict(
         #     prompt=req.prompt,
         #     model=req.model,
@@ -277,12 +346,16 @@ async def _run_with_lock(
         # )
 
     try:
-        output = await _execute_with_resilience(
+        result = await _execute_with_resilience(
                 backend=backend,
                 fallback_backend=fallback_backend,
                 req=req,
                 tenant=tenant
             )
+        output = result["output"]
+        backend_name = result["backend_name"]
+        # retries = result["retries"]
+        # fallback_used = result["fallback_used"]
         # output = await backend.predict(
         #     prompt=req.prompt,
         #     model=req.model,
@@ -290,10 +363,10 @@ async def _run_with_lock(
         #     max_tokens=req.max_tokens,
         # )
 
-        response_payload = json.dumps({"output": output})
+        response_payload = json.dumps({"output": output, "backend_name": backend_name})
         await cache_set(cache_key, response_payload)
 
-        return output
+        return {"output": result["output"], "retries": result["retries"], "fallback_used": result["fallback_used"], "cache_hit": cache_hit, "backend_name": backend_name}
 
     finally:
         await release_lock(lock_key)

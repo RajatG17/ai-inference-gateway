@@ -12,4 +12,4 @@ class LocalBackend(InferenceBackend):
         
         await asyncio.sleep(0.2)
 
-        return f"[local: {model}] processed: {prompt}"
+        return f"[local Model: {model}] processed: {prompt}"
