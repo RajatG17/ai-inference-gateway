@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from prometheus_client import make_asgi_app
 
@@ -41,6 +42,18 @@ import random
 app = FastAPI(
     title="AI Inference Gateway",
     version="0.1.8" # 0.1.8 Structured logging, 0.1.7 Backend router, 0.1.6 Metrics and monitoring, 0.1.5 Cache locking, 0.1.4 Cache bypass, 0.1.3 Rate limiting, 0.1.2 Health checks, 0.1.1 API key auth, 0.1.0 Initial version
+)
+
+origins = [
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 metrics_app = make_asgi_app()
@@ -185,6 +198,7 @@ async def predict(
                 cache_hit = True
                 CACHE_HITS.labels(tenant_id=tenant).inc()
                 response_data = json.loads(cached)
+                print(response_data)
 
                 _record_success_metrics(tenant, start_time)
                 
@@ -195,7 +209,7 @@ async def predict(
                     backend=backend_name,
                 )
                 latency_ms = round((time.time() - start_time)*1000, 2)
-                return PredictResponse(**response_data, latency_ms=latency_ms, cache_hit=cache_hit, retries=0, fallback_used=False)
+                return PredictResponse(**response_data, latency_ms=latency_ms, cache_hit=cache_hit, retries=0, fallback_used=False, backend=backend_name)
 
             CACHE_MISSES.labels(tenant_id=tenant).inc()
 
